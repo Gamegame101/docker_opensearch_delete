@@ -10,9 +10,11 @@ const { createClient } = require('@supabase/supabase-js');
 const OPENSEARCH_NODE = process.env.OPENSEARCH_NODE;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SEEKER_SUPABASE_URL = process.env.SEEKER_SUPABASE_URL;
+const SEEKER_SUPABASE_KEY = process.env.SEEKER_SUPABASE_KEY;
 const INDEX_NAME = 'pageseeker_response_opensearch';
 const TABLE_NAME = 'pageseeker_response_opensearch';
-const DELETE_DAYS = parseInt(process.env.DELETE_DAYS) || 7;
+const DELETE_DAYS = parseInt(process.env.DELETE_DAYS) || 1;
 
 if (!OPENSEARCH_NODE) {
   console.error('❌ Missing OPENSEARCH_NODE environment variable');
@@ -24,10 +26,21 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   process.exit(1);
 }
 
-// Initialize Supabase client
+if (!SEEKER_SUPABASE_URL || !SEEKER_SUPABASE_KEY) {
+  console.error('❌ Missing SEEKER_SUPABASE_URL or SEEKER_SUPABASE_KEY environment variable');
+  process.exit(1);
+}
+
+// Initialize Supabase client (Pageseeker-service)
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: false },
   db: { timeout: 120000, searchPath: 'api' }
+});
+
+// Initialize SEEKER Supabase client
+const seekerSupabase = createClient(SEEKER_SUPABASE_URL, SEEKER_SUPABASE_KEY, {
+  auth: { persistSession: false },
+  db: { timeout: 120000, searchPath: 'seeker' }
 });
 
 // Initialize OpenSearch client
@@ -45,160 +58,203 @@ const osClient = new Client({
   maxRetries: 3
 });
 
+// Calculate cutoff date based on Thailand timezone (UTC+7)
+function getCutoffDateTH(days) {
+  const THAI_OFFSET_MS = 7 * 60 * 60 * 1000;
+  // Shift UTC now to Thai time
+  const nowThaiMs = Date.now() + THAI_OFFSET_MS;
+  const nowThai = new Date(nowThaiMs);
+  // Start of today in Thai time (using UTC methods since we shifted)
+  const todayStartThaiMs = Date.UTC(
+    nowThai.getUTCFullYear(), nowThai.getUTCMonth(), nowThai.getUTCDate()
+  );
+  // Subtract DELETE_DAYS, then convert back to real UTC
+  const cutoffThaiMs = todayStartThaiMs - (days * 24 * 60 * 60 * 1000);
+  const cutoffUTCMs = cutoffThaiMs - THAI_OFFSET_MS;
+  return new Date(cutoffUTCMs);
+}
+
+// Helper: batch delete from Supabase table
+async function batchDeleteSupabase(client, schema, tableName, dateColumn, cutoffIso, label) {
+  console.log(`\n� Deleting from ${schema}.${tableName} (${dateColumn} < ${cutoffIso})...`);
+
+  const { count: totalBefore, error: countErr } = await client
+    .schema(schema)
+    .from(tableName)
+    .select('*', { count: 'exact', head: true });
+
+  if (countErr) {
+    console.error(`   ❌ ${label} count error:`, countErr.message);
+    return 0;
+  }
+  console.log(`   📊 ${label} total records: ${totalBefore}`);
+
+  let deleted = 0;
+  const batchSize = 1000;
+  let hasMore = true;
+
+  while (hasMore) {
+    const { data: oldRows, error: selectErr } = await client
+      .schema(schema)
+      .from(tableName)
+      .select('id')
+      .lt(dateColumn, cutoffIso)
+      .limit(batchSize);
+
+    if (selectErr) {
+      console.error(`   ❌ ${label} select error:`, selectErr.message);
+      break;
+    }
+
+    if (!oldRows || oldRows.length === 0) {
+      hasMore = false;
+      break;
+    }
+
+    const ids = oldRows.map(r => r.id);
+    const { error: delErr } = await client
+      .schema(schema)
+      .from(tableName)
+      .delete()
+      .in('id', ids);
+
+    if (delErr) {
+      console.error(`   ❌ ${label} delete error:`, delErr.message);
+      break;
+    }
+
+    deleted += ids.length;
+    console.log(`   📊 ${label} deleted so far: ${deleted}`);
+  }
+
+  const { count: totalAfter } = await client
+    .schema(schema)
+    .from(tableName)
+    .select('*', { count: 'exact', head: true });
+
+  console.log(`   ✅ ${label} deleted: ${deleted} records (${totalBefore} → ${totalAfter})`);
+  return deleted;
+}
+
 async function deleteOldRecords() {
   const startTime = new Date();
+  const cutoffDate = getCutoffDateTH(DELETE_DAYS);
+  const cutoffIso = cutoffDate.toISOString();
+  const cutoffDateOnly = cutoffIso.split('T')[0]; // YYYY-MM-DD for date columns
+
   console.log(`🗑️  OpenSearch Delete Job Started`);
-  console.log(`📅 Deleting records older than ${DELETE_DAYS} days`);
+  console.log(`📅 Deleting records older than ${DELETE_DAYS} day(s) (Thailand time)`);
   console.log(`📊 Index: ${INDEX_NAME}`);
   console.log(`🕐 Server time: ${startTime.toISOString()}`);
+  console.log(`📅 Cutoff (UTC): ${cutoffIso}`);
+  console.log(`📅 Cutoff (date): ${cutoffDateOnly}`);
 
   try {
-    // Check index exists
+    // ═══════════════════════════════════════════════════════════
+    // 1. Delete from OpenSearch
+    // ═══════════════════════════════════════════════════════════
     const indexExists = (await osClient.indices.exists({ index: INDEX_NAME })).body;
-    if (!indexExists) {
-      console.log('⚠️  Index does not exist, nothing to delete');
-      process.exit(0);
-    }
-
-    // Calculate cutoff date
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - DELETE_DAYS);
-    const cutoffIso = cutoffDate.toISOString();
-    console.log(`📅 Cutoff date: ${cutoffIso}`);
-
-    // Count total records before delete
-    const totalBefore = (await osClient.count({ index: INDEX_NAME })).body.count;
-    console.log(`📊 Total records before delete: ${totalBefore}`);
-
-    // Count records to be deleted
-    const countResult = await osClient.count({
-      index: INDEX_NAME,
-      body: {
-        query: {
-          range: {
-            collected_at: {
-              lt: cutoffIso
-            }
-          }
-        }
-      }
-    });
-
-    const toDelete = countResult.body.count;
-    console.log(`🗑️  Records to delete: ${toDelete}`);
-
-    if (toDelete === 0) {
-      console.log('✅ No old records in OpenSearch');
-    }
-
-    // === Delete from OpenSearch ===
     let osDeleted = 0;
-    if (toDelete > 0) {
-      console.log('🔄 Deleting from OpenSearch...');
-      const deleteResult = await osClient.deleteByQuery({
+    let osBefore = 0;
+    let osAfter = 0;
+
+    if (!indexExists) {
+      console.log('⚠️  OpenSearch index does not exist, skipping');
+    } else {
+      osBefore = (await osClient.count({ index: INDEX_NAME })).body.count;
+      console.log(`\n📊 OpenSearch total records: ${osBefore}`);
+
+      const countResult = await osClient.count({
         index: INDEX_NAME,
         body: {
           query: {
             range: {
-              collected_at: {
-                lt: cutoffIso
-              }
+              collected_at: { lt: cutoffIso }
             }
           }
-        },
-        refresh: true,
-        wait_for_completion: true
+        }
       });
 
-      osDeleted = deleteResult.body.deleted || 0;
-      const failures = deleteResult.body.failures || [];
-      console.log(`   ✅ OpenSearch deleted: ${osDeleted} records`);
+      const toDelete = countResult.body.count;
+      console.log(`🗑️  OpenSearch records to delete: ${toDelete}`);
 
-      if (failures.length > 0) {
-        console.log(`   ⚠️  OpenSearch failures: ${failures.length}`);
-        failures.forEach(f => console.error('     -', f));
+      if (toDelete > 0) {
+        console.log('🔄 Deleting from OpenSearch...');
+        const deleteResult = await osClient.deleteByQuery({
+          index: INDEX_NAME,
+          body: {
+            query: {
+              range: {
+                collected_at: { lt: cutoffIso }
+              }
+            }
+          },
+          refresh: true,
+          wait_for_completion: true
+        });
+
+        osDeleted = deleteResult.body.deleted || 0;
+        const failures = deleteResult.body.failures || [];
+        console.log(`   ✅ OpenSearch deleted: ${osDeleted} records`);
+
+        if (failures.length > 0) {
+          console.log(`   ⚠️  OpenSearch failures: ${failures.length}`);
+          failures.forEach(f => console.error('     -', f));
+        }
+      } else {
+        console.log('✅ No old records in OpenSearch');
       }
+
+      osAfter = (await osClient.count({ index: INDEX_NAME })).body.count;
     }
 
-    // Count remaining OpenSearch records
-    const totalAfter = (await osClient.count({ index: INDEX_NAME })).body.count;
+    // ═══════════════════════════════════════════════════════════
+    // 2. Delete from seeker.meta_ad_response (SEEKER)
+    // ═══════════════════════════════════════════════════════════
+    const adDeleted = await batchDeleteSupabase(
+      seekerSupabase, 'seeker', 'meta_ad_response',
+      'ad_collected_at', cutoffIso, 'SEEKER ad'
+    );
 
-    // === Delete from Supabase ===
-    console.log('');
-    console.log('🔄 Deleting from Supabase...');
-    console.log(`🔎 Supabase table: api.${TABLE_NAME}`);
+    // ═══════════════════════════════════════════════════════════
+    // 3. Delete from seeker.meta_feed_response (SEEKER)
+    // ═══════════════════════════════════════════════════════════
+    const feedDeleted = await batchDeleteSupabase(
+      seekerSupabase, 'seeker', 'meta_feed_response',
+      'feed_collected_at', cutoffIso, 'SEEKER feed'
+    );
 
-    // Count Supabase records to delete
-    const { count: sbCountBefore, error: sbCountErr } = await supabase
-      .schema('api')
-      .from(TABLE_NAME)
-      .select('*', { count: 'exact', head: true });
+    // ═══════════════════════════════════════════════════════════
+    // 4. Delete from api.pageseeker_response_opensearch
+    // ═══════════════════════════════════════════════════════════
+    const pageseekerDeleted = await batchDeleteSupabase(
+      supabase, 'api', TABLE_NAME,
+      'collected_at', cutoffIso, 'Pageseeker'
+    );
 
-    if (sbCountErr) {
-      console.error('   ❌ Supabase count error:', sbCountErr.message);
-    } else {
-      console.log(`   📊 Supabase total records: ${sbCountBefore}`);
-    }
-
-    // Delete old records from Supabase in batches
-    let sbDeleted = 0;
-    const sbBatchSize = 1000;
-    let hasMore = true;
-
-    while (hasMore) {
-      // Select IDs of old records
-      const { data: oldRows, error: selectErr } = await supabase
-        .schema('api')
-        .from(TABLE_NAME)
-        .select('id')
-        .lt('collected_at', cutoffIso)
-        .limit(sbBatchSize);
-
-      if (selectErr) {
-        console.error('   ❌ Supabase select error:', selectErr.message);
-        break;
-      }
-
-      if (!oldRows || oldRows.length === 0) {
-        hasMore = false;
-        break;
-      }
-
-      const ids = oldRows.map(r => r.id);
-      const { error: delErr } = await supabase
-        .schema('api')
-        .from(TABLE_NAME)
-        .delete()
-        .in('id', ids);
-
-      if (delErr) {
-        console.error('   ❌ Supabase delete error:', delErr.message);
-        break;
-      }
-
-      sbDeleted += ids.length;
-      console.log(`   📊 Supabase deleted so far: ${sbDeleted}`);
-    }
-
-    console.log(`   ✅ Supabase deleted: ${sbDeleted} records`);
-
+    // ═══════════════════════════════════════════════════════════
     // Final summary
+    // ═══════════════════════════════════════════════════════════
     const endTime = new Date();
     const duration = ((endTime - startTime) / 1000).toFixed(1);
 
     console.log('');
+    console.log('═══════════════════════════════════════════');
     console.log('✅ Delete Job Completed!');
     console.log(`📊 Results:`);
-    console.log(`   🗑️  OpenSearch deleted: ${osDeleted} records`);
-    console.log(`   📊 OpenSearch: ${totalBefore} → ${totalAfter}`);
-    console.log(`   �️  Supabase deleted: ${sbDeleted} records`);
-    console.log(`   📅 Cutoff: ${cutoffIso}`);
+    console.log(`   🗑️  OpenSearch deleted: ${osDeleted} (${osBefore} → ${osAfter})`);
+    console.log(`   �️  SEEKER meta_ad_response deleted: ${adDeleted}`);
+    console.log(`   🗑️  SEEKER meta_feed_response deleted: ${feedDeleted}`);
+    console.log(`   🗑️  Pageseeker response deleted: ${pageseekerDeleted}`);
+    console.log(`   📅 Cutoff (TH): ${cutoffDateOnly} 00:00 ICT`);
     console.log(`   ⏱️  Duration: ${duration}s`);
+    console.log('═══════════════════════════════════════════');
 
     process.exit(0);
 
   } catch (error) {
     console.error('❌ Delete job failed:', error.message);
+    console.error(error.stack);
     process.exit(1);
   }
 }
