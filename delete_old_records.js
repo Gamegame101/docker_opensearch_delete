@@ -58,19 +58,36 @@ const osClient = new Client({
   maxRetries: 3
 });
 
+// Helper: Format date in ICT timezone
+function formatICT(date) {
+  const THAI_OFFSET_MS = 7 * 60 * 60 * 1000;
+  const ictTime = new Date(date.getTime() + THAI_OFFSET_MS);
+  return ictTime.toISOString().replace('T', ' ').replace('Z', ' ICT');
+}
+
 // Calculate cutoff date based on Thailand timezone (UTC+7)
 function getCutoffDateTH(days) {
   const THAI_OFFSET_MS = 7 * 60 * 60 * 1000;
-  // Shift UTC now to Thai time
-  const nowThaiMs = Date.now() + THAI_OFFSET_MS;
-  const nowThai = new Date(nowThaiMs);
-  // Start of today in Thai time (using UTC methods since we shifted)
+  
+  // Get current time in Thailand (UTC+7)
+  const now = new Date();
+  const thaiTime = new Date(now.getTime() + THAI_OFFSET_MS);
+  
+  // Get start of today in Thai time (00:00 ICT)
+  // We use UTC methods on the shifted time to get midnight
   const todayStartThaiMs = Date.UTC(
-    nowThai.getUTCFullYear(), nowThai.getUTCMonth(), nowThai.getUTCDate()
+    thaiTime.getUTCFullYear(),
+    thaiTime.getUTCMonth(),
+    thaiTime.getUTCDate(),
+    0, 0, 0, 0
   );
-  // Subtract DELETE_DAYS, then convert back to real UTC
+  
+  // Subtract days to get cutoff date (still in Thai timezone context)
   const cutoffThaiMs = todayStartThaiMs - (days * 24 * 60 * 60 * 1000);
+  
+  // Convert back to UTC by subtracting Thai offset
   const cutoffUTCMs = cutoffThaiMs - THAI_OFFSET_MS;
+  
   return new Date(cutoffUTCMs);
 }
 
@@ -145,8 +162,10 @@ async function deleteOldRecords() {
   console.log(`🗑️  OpenSearch Delete Job Started`);
   console.log(`📅 Deleting records older than ${DELETE_DAYS} day(s) (Thailand time)`);
   console.log(`📊 Index: ${INDEX_NAME}`);
-  console.log(`🕐 Server time: ${startTime.toISOString()}`);
+  console.log(`🕐 Server time (UTC): ${startTime.toISOString()}`);
+  console.log(`🕐 Server time (ICT): ${formatICT(startTime)}`);
   console.log(`📅 Cutoff (UTC): ${cutoffIso}`);
+  console.log(`📅 Cutoff (ICT): ${formatICT(cutoffDate)}`);
   console.log(`📅 Cutoff (date): ${cutoffDateOnly}`);
 
   try {
