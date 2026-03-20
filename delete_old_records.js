@@ -309,9 +309,20 @@ async function deleteOldRecords() {
     console.log('═══════════════════════════════════════════');
 
     // ═══════════════════════════════════════════════════════════
-    // 5. Insert log to api.delete_job_log
+    // 5. Insert log to api.delete_job_log (with cumulative)
     // ═══════════════════════════════════════════════════════════
     console.log('\n📝 Saving delete job log...');
+
+    // Fetch last log entry for cumulative calculation
+    const { data: lastLogs } = await supabase
+      .schema('api')
+      .from('delete_job_log')
+      .select('cum_total_deleted, cum_os_deleted, cum_seeker_ad_deleted, cum_seeker_feed_deleted, cum_pageseeker_deleted, cum_risk_level_1_deleted, cum_risk_level_2_deleted, cum_risk_level_3_deleted, cum_risk_level_4_deleted, cum_risk_level_5_deleted')
+      .order('job_run_at', { ascending: false })
+      .limit(1);
+
+    const prev = (lastLogs && lastLogs.length > 0) ? lastLogs[0] : {};
+
     const logEntry = {
       job_run_at: startTime.toISOString(),
       cutoff_date: cutoffIso,
@@ -333,8 +344,21 @@ async function deleteOldRecords() {
       risk_level_3_deleted: riskToDelete[3],
       risk_level_4_deleted: riskToDelete[4],
       risk_level_5_deleted: riskToDelete[5],
-      duration_seconds: parseFloat(duration)
+      duration_seconds: parseFloat(duration),
+      // Cumulative values
+      cum_total_deleted: (prev.cum_total_deleted || 0) + totalDeleted,
+      cum_os_deleted: (prev.cum_os_deleted || 0) + osDeleted,
+      cum_seeker_ad_deleted: (prev.cum_seeker_ad_deleted || 0) + adDeleted,
+      cum_seeker_feed_deleted: (prev.cum_seeker_feed_deleted || 0) + feedDeleted,
+      cum_pageseeker_deleted: (prev.cum_pageseeker_deleted || 0) + pageseekerDeleted,
+      cum_risk_level_1_deleted: (prev.cum_risk_level_1_deleted || 0) + riskToDelete[1],
+      cum_risk_level_2_deleted: (prev.cum_risk_level_2_deleted || 0) + riskToDelete[2],
+      cum_risk_level_3_deleted: (prev.cum_risk_level_3_deleted || 0) + riskToDelete[3],
+      cum_risk_level_4_deleted: (prev.cum_risk_level_4_deleted || 0) + riskToDelete[4],
+      cum_risk_level_5_deleted: (prev.cum_risk_level_5_deleted || 0) + riskToDelete[5],
     };
+
+    console.log(`   📊 Cumulative total deleted: ${logEntry.cum_total_deleted}`);
 
     const { error: logError } = await supabase
       .schema('api')
