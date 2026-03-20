@@ -153,6 +153,33 @@ async function batchDeleteSupabase(client, schema, tableName, dateColumn, cutoff
   return deleted;
 }
 
+// Helper: count risk_level distribution from api.pageseeker_response_opensearch
+async function countRiskLevels(cutoffIso, mode) {
+  // mode: 'all' = count all records, 'old' = count records < cutoff
+  const counts = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+
+  for (let level = 1; level <= 5; level++) {
+    let query = supabase
+      .schema('api')
+      .from(TABLE_NAME)
+      .select('*', { count: 'exact', head: true })
+      .eq('ad_risk_level', level);
+
+    if (mode === 'old') {
+      query = query.lt('collected_at', cutoffIso);
+    }
+
+    const { count, error } = await query;
+    if (error) {
+      console.error(`   ❌ Risk level ${level} count error:`, error.message);
+    } else {
+      counts[level] = count || 0;
+    }
+  }
+
+  return counts;
+}
+
 async function deleteOldRecords() {
   const startTime = new Date();
   const cutoffDate = getCutoffDateTH(DELETE_DAYS);
@@ -169,6 +196,17 @@ async function deleteOldRecords() {
   console.log(`📅 Cutoff (date): ${cutoffDateOnly}`);
 
   try {
+    // ═══════════════════════════════════════════════════════════
+    // 0. Count risk_level distribution BEFORE delete
+    // ═══════════════════════════════════════════════════════════
+    console.log('\n📊 Counting risk_level distribution (before delete)...');
+    const riskBefore = await countRiskLevels(cutoffIso, 'all');
+    console.log(`   Risk levels before: L1=${riskBefore[1]} L2=${riskBefore[2]} L3=${riskBefore[3]} L4=${riskBefore[4]} L5=${riskBefore[5]}`);
+
+    console.log('📊 Counting risk_level distribution (to be deleted)...');
+    const riskToDelete = await countRiskLevels(cutoffIso, 'old');
+    console.log(`   Risk levels to delete: L1=${riskToDelete[1]} L2=${riskToDelete[2]} L3=${riskToDelete[3]} L4=${riskToDelete[4]} L5=${riskToDelete[5]}`);
+
     // ═══════════════════════════════════════════════════════════
     // 1. Delete from OpenSearch
     // ═══════════════════════════════════════════════════════════
@@ -256,18 +294,58 @@ async function deleteOldRecords() {
     // ═══════════════════════════════════════════════════════════
     const endTime = new Date();
     const duration = ((endTime - startTime) / 1000).toFixed(1);
+    const totalDeleted = osDeleted + adDeleted + feedDeleted + pageseekerDeleted;
 
     console.log('');
     console.log('═══════════════════════════════════════════');
     console.log('✅ Delete Job Completed!');
     console.log(`📊 Results:`);
     console.log(`   🗑️  OpenSearch deleted: ${osDeleted} (${osBefore} → ${osAfter})`);
-    console.log(`   �️  SEEKER meta_ad_response deleted: ${adDeleted}`);
+    console.log(`   🗑️  SEEKER meta_ad_response deleted: ${adDeleted}`);
     console.log(`   🗑️  SEEKER meta_feed_response deleted: ${feedDeleted}`);
     console.log(`   🗑️  Pageseeker response deleted: ${pageseekerDeleted}`);
     console.log(`   📅 Cutoff (TH): ${cutoffDateOnly} 00:00 ICT`);
     console.log(`   ⏱️  Duration: ${duration}s`);
     console.log('═══════════════════════════════════════════');
+
+    // ═══════════════════════════════════════════════════════════
+    // 5. Insert log to api.delete_job_log
+    // ═══════════════════════════════════════════════════════════
+    console.log('\n📝 Saving delete job log...');
+    const logEntry = {
+      job_run_at: startTime.toISOString(),
+      cutoff_date: cutoffIso,
+      delete_days: DELETE_DAYS,
+      os_before: osBefore,
+      os_deleted: osDeleted,
+      os_after: osAfter,
+      seeker_ad_deleted: adDeleted,
+      seeker_feed_deleted: feedDeleted,
+      pageseeker_deleted: pageseekerDeleted,
+      total_deleted: totalDeleted,
+      risk_level_1_before: riskBefore[1],
+      risk_level_2_before: riskBefore[2],
+      risk_level_3_before: riskBefore[3],
+      risk_level_4_before: riskBefore[4],
+      risk_level_5_before: riskBefore[5],
+      risk_level_1_deleted: riskToDelete[1],
+      risk_level_2_deleted: riskToDelete[2],
+      risk_level_3_deleted: riskToDelete[3],
+      risk_level_4_deleted: riskToDelete[4],
+      risk_level_5_deleted: riskToDelete[5],
+      duration_seconds: parseFloat(duration)
+    };
+
+    const { error: logError } = await supabase
+      .schema('api')
+      .from('delete_job_log')
+      .insert(logEntry);
+
+    if (logError) {
+      console.error('   ❌ Failed to save log:', logError.message);
+    } else {
+      console.log('   ✅ Delete job log saved successfully');
+    }
 
     process.exit(0);
 
