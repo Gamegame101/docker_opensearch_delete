@@ -180,6 +180,92 @@ async function countRiskLevels(cutoffIso, mode) {
   return counts;
 }
 
+// Helper: archive rows to delete table, then delete from source
+async function archiveThenDelete(client, schema, sourceTable, archiveTable, dateColumn, cutoffIso, label) {
+  console.log(`\n📦 Archiving + deleting from ${schema}.${sourceTable} (${dateColumn} < ${cutoffIso})...`);
+
+  const { count: totalBefore, error: countErr } = await client
+    .schema(schema)
+    .from(sourceTable)
+    .select('*', { count: 'exact', head: true });
+
+  if (countErr) {
+    console.error(`   ❌ ${label} count error:`, countErr.message);
+    return { archived: 0, deleted: 0 };
+  }
+  console.log(`   📊 ${label} total records: ${totalBefore}`);
+
+  let archived = 0;
+  let deleted = 0;
+  const batchSize = 500;
+  let hasMore = true;
+
+  while (hasMore) {
+    // Select full rows to archive
+    const { data: oldRows, error: selectErr } = await client
+      .schema(schema)
+      .from(sourceTable)
+      .select('*')
+      .lt(dateColumn, cutoffIso)
+      .limit(batchSize);
+
+    if (selectErr) {
+      console.error(`   ❌ ${label} select error:`, selectErr.message);
+      break;
+    }
+
+    if (!oldRows || oldRows.length === 0) {
+      hasMore = false;
+      break;
+    }
+
+    // Prepare archive rows (add deleted_at and delete_reason)
+    const now = new Date().toISOString();
+    const archiveRows = oldRows.map(row => ({
+      ...row,
+      deleted_at: now,
+      delete_reason: 'expired'
+    }));
+
+    // Insert into archive table (ON CONFLICT DO NOTHING to avoid duplicates)
+    const { error: archiveErr } = await client
+      .schema(schema)
+      .from(archiveTable)
+      .upsert(archiveRows, { onConflict: 'id', ignoreDuplicates: true });
+
+    if (archiveErr) {
+      console.error(`   ❌ ${label} archive error:`, archiveErr.message);
+      break;
+    }
+
+    archived += oldRows.length;
+
+    // Delete from source only after successful archive
+    const ids = oldRows.map(r => r.id);
+    const { error: delErr } = await client
+      .schema(schema)
+      .from(sourceTable)
+      .delete()
+      .in('id', ids);
+
+    if (delErr) {
+      console.error(`   ❌ ${label} delete error:`, delErr.message);
+      break;
+    }
+
+    deleted += ids.length;
+    console.log(`   📊 ${label} archived+deleted so far: ${deleted}`);
+  }
+
+  const { count: totalAfter } = await client
+    .schema(schema)
+    .from(sourceTable)
+    .select('*', { count: 'exact', head: true });
+
+  console.log(`   ✅ ${label} archived: ${archived}, deleted: ${deleted} (${totalBefore} → ${totalAfter})`);
+  return { archived, deleted };
+}
+
 async function deleteOldRecords() {
   const startTime = new Date();
   const cutoffDate = getCutoffDateTH(DELETE_DAYS);
@@ -282,10 +368,10 @@ async function deleteOldRecords() {
     );
 
     // ═══════════════════════════════════════════════════════════
-    // 4. Delete from api.pageseeker_response_opensearch
+    // 4. Archive + Delete from api.pageseeker_response_opensearch
     // ═══════════════════════════════════════════════════════════
-    const pageseekerDeleted = await batchDeleteSupabase(
-      supabase, 'api', TABLE_NAME,
+    const { archived: pageseekerArchived, deleted: pageseekerDeleted } = await archiveThenDelete(
+      supabase, 'api', TABLE_NAME, 'pageseeker_response_delete',
       'collected_at', cutoffIso, 'Pageseeker'
     );
 
@@ -303,7 +389,8 @@ async function deleteOldRecords() {
     console.log(`   🗑️  OpenSearch deleted: ${osDeleted} (${osBefore} → ${osAfter})`);
     console.log(`   🗑️  SEEKER meta_ad_response deleted: ${adDeleted}`);
     console.log(`   🗑️  SEEKER meta_feed_response deleted: ${feedDeleted}`);
-    console.log(`   🗑️  Pageseeker response deleted: ${pageseekerDeleted}`);
+    console.log(`   � Pageseeker response archived: ${pageseekerArchived}`);
+    console.log(`   �🗑️  Pageseeker response deleted: ${pageseekerDeleted}`);
     console.log(`   📅 Cutoff (TH): ${cutoffDateOnly} 00:00 ICT`);
     console.log(`   ⏱️  Duration: ${duration}s`);
     console.log('═══════════════════════════════════════════');
