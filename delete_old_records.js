@@ -12,7 +12,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SEEKER_SUPABASE_URL = process.env.SEEKER_SUPABASE_URL;
 const SEEKER_SUPABASE_KEY = process.env.SEEKER_SUPABASE_KEY;
-const INDEX_NAME = 'pageseeker_response_opensearch';
+const INDEX_NAME = 'pageseeker_response_opensearch_v2';
 const TABLE_NAME = 'pageseeker_response_opensearch';
 const DELETE_DAYS = parseInt(process.env.DELETE_DAYS) || 1;
 
